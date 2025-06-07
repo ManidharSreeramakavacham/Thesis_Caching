@@ -1,0 +1,122 @@
+---
+- name: NFS Client Configuration Playbook
+  hosts: localhost
+  become: yes
+
+   vars:
+    # deploy_script: "/deploy.sh"
+    nfs_mount_path: "/mnt"
+    nfs_server_path: "/srv/myrepo/packages/mirror"
+    sources_list_file: "/etc/apt/sources.list"
+    temp_file: "/tmp/install_data.log"
+    bandwidths:  # Bandwidth variations for network shaping
+      - "10mbit"
+      - "20mbit"
+      - "50mbit"
+    packages:  # List of packages to install
+      - "curl"
+      - "nginx"
+      - "vlc"
+    git_repo_url: "https://github.com/kimt22/apt_test.git"
+    repo_clone_path: "/tmp/modified-apt-source"
+    openstack_rc_file: "/RC"
+
+  tasks:
+    loop: "{{ bandwidths }}"
+    #- name: Source OpenStack RC File
+    #  shell: |
+    #    source "{{ openstack_rc_file }}"
+    #  register: openstack_rc_sourced
+    #  ignore_errors: no
+
+    #- name: Deploy Server using deploy.sh
+    #  shell: "{{ deploy_script }}"
+    #  register: deploy_result
+    #  ignore_errors: no
+
+      - name: Gather facts
+        ansible.builtin.setup:
+
+      - name: Clone Modified APT Source Code Repository
+        git:
+          repo: "{{ git_repo_url }}"
+          dest: "{{ repo_clone_path }}"
+          update: yes
+
+      - name: Rebuild Modified APT Source Code
+        shell: |
+          cd "{{ repo_clone_path }}" && debuild -us -uc -b
+        args:
+          chdir: "{{ repo_clone_path }}"
+        register: build_result
+
+      - name: Install Rebuilt APT Package
+        apt:
+          deb: "{{ repo_clone_path }}/../*.deb"
+          state: present
+
+      - name: Update sources
+        apt:
+          update_cache: yes
+
+      - name: Install NFS Client
+        apt:
+          name: nfs-common
+          state: present
+
+      - name: Create NFS Mount Directory
+        file:
+          path: "{{ nfs_mount_path }}"
+          state: directory
+
+      - name: Mount NFS Share
+        command: mount -t nfs 192.168.100.134:/"{{ nfs_server_path }}" "{{ nfs_mount_path }}"
+
+      - name: Update sources.list
+        lineinfile:
+          path: "{{ sources_list_file }}"
+          regexp: '^deb '
+          state: absent
+
+      - name: Add NFS sources to sources.list
+        blockinfile:
+          path: "{{ sources_list_file }}"
+          block: |
+            deb file:{{ nfs_mount_path }}/archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+            deb file:{{ nfs_mount_path }}/archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+            deb file:{{ nfs_mount_path }}/archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+            deb file:{{ nfs_mount_path }}/archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+
+      - name: Update Package List
+        apt:
+          update_cache: yes
+
+      - name: Loop Through Bandwidths
+        tasks:
+          - name: Set Network Bandwidth egress
+            command: sudo tc qdisc add dev enp0s3 root handle 1:tbf rate {{ item }} brust 32kbit latency 400ms
+            ignore_errors: yes
+
+          - name: Set Network Bandwidth ingress
+            command: sudo tc qdisc add dev enp0s3 root handle ffff:ingress 
+            command: sudo tc filter add dev enp0s3 parent ffff:protocol ip prio 1 u32 match ip src 0.0.0.0/0 police rate {{ item }} brust 32k drop
+            ignore_errors: yes
+
+          - name: Measure Installation Time for Packages
+            loop: "{{ packages }}"
+            shell: |
+              { time apt-get install -y {{ item }} >/dev/null 2>&1; } 2>&1 | awk '/real/ {print $2}' | \ tee -a "{{ temp_file }}"
+            ignore_errors: yes
+
+          - name: Copy Data to Temporary File
+            copy:
+              content: "{{ lookup('file', temp_file) }}"
+              dest: "{{ temp_file }}"
+
+      - name: Cleanup - Rebuild/Factory Reset Server using OpenStack
+        os_server_action:
+        cloud: "openstack"
+        server: "server_name"
+        action: rebuild
+        image: "image_name"
+        delegate_to: localhost
